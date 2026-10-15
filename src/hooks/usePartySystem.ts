@@ -20,6 +20,32 @@ interface Party {
   status: 'forming' | 'queuing' | 'matched';
   match_id: string | null;
   members: PartyMember[];
+  code: string | null;
+  name: string;
+}
+
+// Generate a short alphanumeric squad code
+function generateSquadCode(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no confusing chars
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code;
+}
+
+export interface SquadInvite {
+  id: string;
+  party_id: string;
+  sender_id: string;
+  receiver_id: string;
+  status: 'pending' | 'accepted' | 'declined' | 'expired' | 'cancelled';
+  created_at: string;
+  // Enriched fields
+  senderUsername?: string;
+  senderUniqueId?: string;
+  receiverUsername?: string;
+  receiverUniqueId?: string;
 }
 
 export const usePartySystem = () => {
@@ -27,6 +53,8 @@ export const usePartySystem = () => {
   const [party, setParty] = useState<Party | null>(null);
   const [loading, setLoading] = useState(true);
   const [invites, setInvites] = useState<{ partyId: string; leaderName: string }[]>([]);
+  const [squadInvites, setSquadInvites] = useState<SquadInvite[]>([]);
+  const [invitesLoading, setInvitesLoading] = useState(false);
 
   // Fetch current party
   const fetchParty = useCallback(async () => {
@@ -98,6 +126,8 @@ export const usePartySystem = () => {
         status: partyData.status as 'forming' | 'queuing' | 'matched',
         match_id: partyData.match_id,
         members: partyMembers,
+        code: (partyData as Record<string, unknown>).code as string | null,
+        name: ((partyData as Record<string, unknown>).name as string) || 'Squad',
       });
     } catch (err) {
       console.error('Error fetching party:', err);
@@ -120,20 +150,49 @@ export const usePartySystem = () => {
       .delete()
       .eq('user_id', user.id);
 
-    // Create the party
-    const { data: partyData, error: partyError } = await supabase
+    // Generate a unique squad code
+    const squadCode = generateSquadCode();
+
+    // Try to create party with code/name columns first; fall back without them
+    // if the migration hasn't been applied yet.
+    let partyData: Record<string, unknown> | null = null;
+    let partyError: unknown = null;
+
+    const baseInsert = {
+      leader_id: user.id,
+      game_mode: gameMode,
+      team_size: teamSize,
+      status: 'forming',
+    };
+
+    // Attempt 1: with code + name columns
+    const res1 = await supabase
       .from('parties')
       .insert({
-        leader_id: user.id,
-        game_mode: gameMode,
-        team_size: teamSize,
-        status: 'forming',
-      })
+        ...baseInsert,
+        code: squadCode,
+        name: `${profile.username}'s Squad`,
+      } as Record<string, unknown>)
       .select()
       .single();
 
+    if (res1.error) {
+      console.warn('[Party] Insert with code/name failed, retrying without:', res1.error.message);
+      // Attempt 2: without code/name (migration not applied)
+      const res2 = await supabase
+        .from('parties')
+        .insert(baseInsert)
+        .select()
+        .single();
+      partyData = res2.data as Record<string, unknown> | null;
+      partyError = res2.error;
+    } else {
+      partyData = res1.data as Record<string, unknown> | null;
+    }
+
     if (partyError || !partyData) {
       setLoading(false);
+      console.error('[Party] Failed to create party:', partyError);
       return { error: 'Failed to create party' };
     }
 
@@ -158,7 +217,76 @@ export const usePartySystem = () => {
     return { error: null, partyId: partyData.id };
   }, [user, profile, fetchParty]);
 
-  // Invite a friend to party
+  // ─── Squad Invitations System ─────────────────────────────────────
+
+  // Fetch all invitations (sent and received)
+  const fetchInvites = useCallback(async () => {
+    if (!user) return;
+    setInvitesLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from('squad_invitations')
+        .select('*')
+        .or(`sender_id.eq.${user.id},receiver_id.eq.${user.id}`)
+        .in('status', ['pending'])
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error('Error fetching squad invites:', error);
+        setSquadInvites([]);
+        setInvitesLoading(false);
+        return;
+      }
+
+      if (!data || data.length === 0) {
+        setSquadInvites([]);
+        setInvitesLoading(false);
+        return;
+      }
+
+      // Collect all unique user IDs to fetch profiles
+      const userIds = new Set<string>();
+      data.forEach(inv => {
+        userIds.add(inv.sender_id);
+        userIds.add(inv.receiver_id);
+      });
+
+      const { data: profiles } = await supabase
+        .from('profiles')
+        .select('user_id, username, unique_id')
+        .in('user_id', Array.from(userIds));
+
+      const enriched: SquadInvite[] = data.map(inv => {
+        const sender = profiles?.find(p => p.user_id === inv.sender_id);
+        const receiver = profiles?.find(p => p.user_id === inv.receiver_id);
+        return {
+          id: inv.id,
+          party_id: inv.party_id,
+          sender_id: inv.sender_id,
+          receiver_id: inv.receiver_id,
+          status: inv.status as SquadInvite['status'],
+          created_at: inv.created_at,
+          senderUsername: sender?.username || 'Unknown',
+          senderUniqueId: sender?.unique_id || '',
+          receiverUsername: receiver?.username || 'Unknown',
+          receiverUniqueId: receiver?.unique_id || '',
+        };
+      });
+
+      // Filter out expired invites (>5 minutes old)
+      const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+      const valid = enriched.filter(inv => inv.created_at > fiveMinAgo);
+
+      setSquadInvites(valid);
+    } catch (err) {
+      console.error('Error fetching invites:', err);
+      setSquadInvites([]);
+    } finally {
+      setInvitesLoading(false);
+    }
+  }, [user]);
+
+  // Send an invite to a friend (persistent + broadcast)
   const inviteToParty = useCallback(async (friendUserId: string) => {
     if (!party || party.leader_id !== user?.id) {
       return { error: 'Only party leader can invite' };
@@ -168,25 +296,172 @@ export const usePartySystem = () => {
       return { error: 'Party is full' };
     }
 
-    // For now, we'll directly add them (in production, you'd send an invite notification)
-    const { error } = await supabase
-      .from('party_members')
-      .insert({
-        party_id: party.id,
-        user_id: friendUserId,
-        is_ready: false,
-      });
-
-    if (error) {
-      if (error.code === '23505') {
-        return { error: 'Already in party' };
-      }
-      return { error: 'Failed to invite' };
+    // Check if already in party
+    if (party.members.some(m => m.user_id === friendUserId)) {
+      return { error: 'Already in party' };
     }
 
-    await fetchParty();
+    // Check for existing pending invite
+    const { data: existing } = await supabase
+      .from('squad_invitations')
+      .select('id')
+      .eq('party_id', party.id)
+      .eq('receiver_id', friendUserId)
+      .eq('status', 'pending')
+      .maybeSingle();
+
+    if (existing) {
+      return { error: 'Invite already sent' };
+    }
+
+    // Create persistent invitation record
+    const { error: insertError } = await supabase
+      .from('squad_invitations')
+      .insert({
+        party_id: party.id,
+        sender_id: user.id,
+        receiver_id: friendUserId,
+        status: 'pending',
+      });
+
+    if (insertError) {
+      console.error('Failed to create invite:', insertError);
+      return { error: 'Failed to send invite' };
+    }
+
+    // Also send real-time broadcast for instant toast notification
+    const channel = supabase.channel(`invites-${friendUserId}`);
+    channel.subscribe(async (status) => {
+      if (status === 'SUBSCRIBED') {
+        await channel.send({
+          type: 'broadcast',
+          event: 'invite',
+          payload: {
+            partyId: party.id,
+            leaderName: profile?.username || 'Opponent',
+          }
+        });
+        setTimeout(() => {
+          supabase.removeChannel(channel);
+        }, 1000);
+      }
+    });
+
+    await fetchInvites();
     return { error: null };
-  }, [party, user, fetchParty]);
+  }, [party, user, profile, fetchInvites]);
+
+  // Cancel a sent invite
+  const cancelInvite = useCallback(async (inviteId: string) => {
+    if (!user) return { error: 'Not authenticated' };
+
+    const { error } = await supabase
+      .from('squad_invitations')
+      .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+      .eq('id', inviteId)
+      .eq('sender_id', user.id);
+
+    if (error) {
+      return { error: 'Failed to cancel invite' };
+    }
+
+    await fetchInvites();
+    return { error: null };
+  }, [user, fetchInvites]);
+
+  // Respond to an invite (accept or decline)
+  const respondToInvite = useCallback(async (inviteId: string, accept: boolean) => {
+    if (!user) return { error: 'Not authenticated' };
+
+    // Get the invite details
+    const { data: invite, error: fetchError } = await supabase
+      .from('squad_invitations')
+      .select('*')
+      .eq('id', inviteId)
+      .eq('receiver_id', user.id)
+      .single();
+
+    if (fetchError || !invite) {
+      return { error: 'Invite not found' };
+    }
+
+    if (accept) {
+      // Leave current party if any
+      const { data: currentMember } = await supabase
+        .from('party_members')
+        .select('party_id')
+        .eq('user_id', user.id)
+        .single();
+
+      if (currentMember) {
+        // Check if leader of current party
+        const { data: currentParty } = await supabase
+          .from('parties')
+          .select('leader_id')
+          .eq('id', currentMember.party_id)
+          .single();
+
+        // Remove from current party
+        await supabase
+          .from('party_members')
+          .delete()
+          .eq('user_id', user.id)
+          .eq('party_id', currentMember.party_id);
+
+        // If was leader, delete old party
+        if (currentParty?.leader_id === user.id) {
+          await supabase
+            .from('parties')
+            .delete()
+            .eq('id', currentMember.party_id);
+        }
+      }
+
+      // Join the new party
+      const { error: joinError } = await supabase
+        .from('party_members')
+        .insert({
+          party_id: invite.party_id,
+          user_id: user.id,
+          is_ready: false,
+        });
+
+      if (joinError) {
+        if (joinError.code === '23505') {
+          // Already in party (race condition)
+          await supabase
+            .from('squad_invitations')
+            .update({ status: 'accepted', updated_at: new Date().toISOString() })
+            .eq('id', inviteId);
+          await fetchParty();
+          await fetchInvites();
+          return { error: null };
+        }
+        return { error: 'Failed to join squad: ' + joinError.message };
+      }
+    }
+
+    // Update invite status
+    const { error: updateError } = await supabase
+      .from('squad_invitations')
+      .update({
+        status: accept ? 'accepted' : 'declined',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', inviteId);
+
+    if (updateError) {
+      return { error: 'Failed to update invite' };
+    }
+
+    if (accept) {
+      await fetchParty();
+      toast.success('Joined squad!');
+    }
+
+    await fetchInvites();
+    return { error: null };
+  }, [user, fetchParty, fetchInvites]);
 
   // Leave the party
   const leaveParty = useCallback(async () => {
@@ -285,7 +560,8 @@ export const usePartySystem = () => {
   // Initial fetch
   useEffect(() => {
     fetchParty();
-  }, [fetchParty]);
+    fetchInvites();
+  }, [fetchParty, fetchInvites]);
 
   // Subscribe to our own party membership changes (for joins, kicks, surrenders)
   useEffect(() => {
@@ -346,13 +622,87 @@ export const usePartySystem = () => {
     };
   }, [party, fetchParty]);
 
-  // Poll for matchmaking when queuing (leader only)
+  // Subscribe to squad invitations changes (realtime)
+  useEffect(() => {
+    if (!user) return;
+
+    const channel = supabase
+      .channel(`squad-invites-${user.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'squad_invitations',
+          filter: `receiver_id=eq.${user.id}`,
+        },
+        (payload) => {
+          console.log('[Invites] Received invite change:', payload);
+          fetchInvites();
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'squad_invitations',
+          filter: `sender_id=eq.${user.id}`,
+        },
+        () => fetchInvites()
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [user, fetchInvites]);
+
+  // Poll for matchmaking when queuing (leader only) — uses atomic RPC
   useEffect(() => {
     if (!party || party.status !== 'queuing' || party.leader_id !== user?.id) return;
 
+    let cancelled = false;
+
     const interval = setInterval(async () => {
+      if (cancelled) return;
       try {
-        // Find another queuing party with the same settings
+        // Touch updated_at so our party stays "alive" in the queue
+        await supabase
+          .from('parties')
+          .update({ updated_at: new Date().toISOString() })
+          .eq('id', party.id);
+
+        // Call the atomic RPC
+        const { data: matchId, error: rpcError } = await supabase.rpc(
+          'find_or_create_squad_match' as never,
+          { p_party_id: party.id } as never
+        );
+
+        if (rpcError) {
+          // If RPC doesn't exist yet, fall back to client-side matching
+          if (rpcError.message?.includes('function') || rpcError.code === '42883') {
+            console.warn('[Squad Match] RPC not available, trying client-side fallback');
+            await tryClientSideSquadMatch();
+            return;
+          }
+          console.error('[Squad Match] RPC error:', rpcError);
+          return;
+        }
+
+        if (matchId) {
+          console.log('[Squad Match] RPC matched! Match ID:', matchId);
+          // Refetch party to pick up matched status + match_id
+          await fetchParty();
+        }
+      } catch (err) {
+        console.error('Squad matchmaking poll error:', err);
+      }
+    }, 3000);
+
+    // Client-side fallback (in case the RPC migration hasn't been applied)
+    const tryClientSideSquadMatch = async () => {
+      try {
         const { data: opponents, error } = await supabase
           .from('parties')
           .select('*')
@@ -367,7 +717,6 @@ export const usePartySystem = () => {
 
         const opponentParty = opponents[0];
 
-        // Fetch opponent members
         const { data: opponentMembers } = await supabase
           .from('party_members')
           .select('user_id')
@@ -375,13 +724,11 @@ export const usePartySystem = () => {
 
         if (!opponentMembers || opponentMembers.length === 0) return;
 
-        // Collect member IDs
         const myMemberIds = party.members.map(m => m.user_id);
         const opponentMemberIds = opponentMembers.map(m => m.user_id);
 
-        console.log('[Squad Match] Found opponent party! Matching now...', opponentParty.id);
+        console.log('[Squad Match] Client-side fallback: matching with', opponentParty.id);
 
-        // Create the match
         const { data: match, error: matchError } = await supabase
           .from('matches')
           .insert({
@@ -400,7 +747,6 @@ export const usePartySystem = () => {
           return;
         }
 
-        // Update both parties to matched
         await Promise.all([
           supabase
             .from('parties')
@@ -412,18 +758,144 @@ export const usePartySystem = () => {
             .eq('id', opponentParty.id)
         ]);
 
-        console.log('[Squad Match] Successfully matched squads!');
+        console.log('[Squad Match] Client-side fallback: matched!');
+        await fetchParty();
       } catch (err) {
-        console.error('Squad matchmaking poll error:', err);
+        console.error('Client-side squad match error:', err);
       }
-    }, 3000);
+    };
 
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [party, user, fetchParty]);
+
+  // Join a squad by code
+  const joinByCode = useCallback(async (code: string) => {
+    if (!user) return { error: 'Not authenticated' };
+
+    const trimmed = code.trim().toUpperCase();
+    if (!trimmed || trimmed.length < 4) {
+      return { error: 'Invalid squad code' };
+    }
+
+    try {
+      const { data, error: rpcError } = await supabase.rpc(
+        'join_party_by_code' as never,
+        { p_code: trimmed } as never
+      );
+
+      if (rpcError) {
+        // RPC not available — fallback to client-side join
+        if (rpcError.message?.includes('function') || rpcError.code === '42883') {
+          console.warn('[JoinByCode] RPC not available, using client-side fallback');
+          return await joinByCodeClientFallback(trimmed);
+        }
+        return { error: rpcError.message || 'Failed to join' };
+      }
+
+      const result = data as unknown as { success: boolean; error?: string; party_id?: string };
+      if (!result?.success) {
+        return { error: result?.error || 'Failed to join squad' };
+      }
+
+      await fetchParty();
+      toast.success('Joined squad!');
+      return { error: null };
+    } catch (err) {
+      console.error('[JoinByCode] Error:', err);
+      return { error: 'Failed to join squad' };
+    }
+  }, [user, fetchParty]);
+
+  // Client-side fallback for join by code (when RPC not deployed yet)
+  const joinByCodeClientFallback = useCallback(async (code: string) => {
+    if (!user) return { error: 'Not authenticated' };
+
+    // Find the party by code
+    const { data: parties, error: findError } = await supabase
+      .from('parties')
+      .select('*')
+      .eq('status', 'forming');
+
+    if (findError || !parties) {
+      return { error: 'Could not search for squad' };
+    }
+
+    // Filter by code match (case-insensitive) using raw column access
+    const targetParty = parties.find((p: Record<string, unknown>) => {
+      const partyCode = (p.code as string || '').toUpperCase();
+      return partyCode === code;
+    });
+
+    if (!targetParty) {
+      return { error: 'Squad not found or match already started' };
+    }
+
+    // Check capacity
+    const { count } = await supabase
+      .from('party_members')
+      .select('*', { count: 'exact', head: true })
+      .eq('party_id', targetParty.id);
+
+    if ((count || 0) >= targetParty.team_size) {
+      return { error: 'Squad is full' };
+    }
+
+    // Check if already in this party
+    const { data: existingMember } = await supabase
+      .from('party_members')
+      .select('id')
+      .eq('party_id', targetParty.id)
+      .eq('user_id', user.id)
+      .maybeSingle();
+
+    if (existingMember) {
+      await fetchParty();
+      return { error: null };
+    }
+
+    // Leave current party
+    const { data: currentMember } = await supabase
+      .from('party_members')
+      .select('party_id')
+      .eq('user_id', user.id)
+      .single();
+
+    if (currentMember) {
+      const { data: currentParty } = await supabase
+        .from('parties')
+        .select('leader_id')
+        .eq('id', currentMember.party_id)
+        .single();
+
+      await supabase.from('party_members').delete().eq('user_id', user.id);
+      if (currentParty?.leader_id === user.id) {
+        await supabase.from('parties').delete().eq('id', currentMember.party_id);
+      }
+    }
+
+    // Join
+    const { error: joinError } = await supabase
+      .from('party_members')
+      .insert({ party_id: targetParty.id, user_id: user.id, is_ready: false });
+
+    if (joinError) {
+      return { error: 'Failed to join: ' + joinError.message };
+    }
+
+    await fetchParty();
+    toast.success('Joined squad!');
+    return { error: null };
+  }, [user, fetchParty]);
 
   const isLeader = party?.leader_id === user?.id;
   const isFull = party ? party.members.length >= party.team_size : false;
   const allReady = party?.members.every(m => m.is_ready) || false;
+
+  const incomingInvites = squadInvites.filter(inv => inv.receiver_id === user?.id);
+  const outgoingInvites = squadInvites.filter(inv => inv.sender_id === user?.id);
 
   return {
     party,
@@ -433,11 +905,19 @@ export const usePartySystem = () => {
     isFull,
     allReady,
     createParty,
+    joinByCode,
     inviteToParty,
+    cancelInvite,
+    respondToInvite,
     leaveParty,
     toggleReady,
     startQueue,
     kickMember,
     fetchParty,
+    fetchInvites,
+    squadInvites,
+    incomingInvites,
+    outgoingInvites,
+    invitesLoading,
   };
 };

@@ -4,14 +4,26 @@ import MapCard from '@/components/MapCard';
 import LoadingScreen from '@/components/LoadingScreen';
 import CharacterViewer from '@/components/CharacterViewer';
 import FriendsPanel from '@/components/FriendsPanel';
+import CreateSquadDialog from '@/components/CreateSquadDialog';
+import SquadPanel from '@/components/SquadPanel';
+import InvitationsPanel from '@/components/InvitationsPanel';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+  DialogDescription,
+} from '@/components/ui/dialog';
 import { toast } from 'sonner';
 import { useMatchmaking } from '@/hooks/useMatchmaking';
 import { usePartySystem } from '@/hooks/usePartySystem';
 import { useAuth } from '@/contexts/AuthContext';
 import { supabase } from '@/integrations/supabase/client';
-import { Users, Shield, LogOut, Check, UserMinus } from 'lucide-react';
+import { Users, Shield, LogOut, Check, UserMinus, Mail, Hash, Loader2 } from 'lucide-react';
 
 // Fallback for missing jQuery types if still an issue
 declare global {
@@ -43,6 +55,10 @@ const Lobby: React.FC = () => {
   const [selectedMode, setSelectedMode] = useState<GameMode>('campaign');
   const [teamSize, setTeamSize] = useState('5');
   const [friendsOpen, setFriendsOpen] = useState(false);
+  const [invitationsOpen, setInvitationsOpen] = useState(false);
+  const [joinCodeValue, setJoinCodeValue] = useState('');
+  const [joiningByCode, setJoiningByCode] = useState(false);
+  const [joinCodeDialogOpen, setJoinCodeDialogOpen] = useState(false);
   
   // Solo matchmaking hook
   const { joinQueue, leaveQueue, status: soloStatus, matchId: soloMatchId } = useMatchmaking();
@@ -53,10 +69,12 @@ const Lobby: React.FC = () => {
     isLeader,
     allReady,
     createParty,
+    joinByCode,
     leaveParty,
     toggleReady,
     startQueue,
     kickMember,
+    incomingInvites,
     loading: partyLoading
   } = usePartySystem();
 
@@ -101,7 +119,7 @@ const Lobby: React.FC = () => {
     autoInitParty();
   }, [user, party, partyLoading, createParty, selectedMode, teamSize]);
 
-  // Real-time broadcast invite listener
+  // Real-time broadcast invite listener (for instant toast notifications)
   useEffect(() => {
     if (!user) return;
 
@@ -126,30 +144,17 @@ const Lobby: React.FC = () => {
               variant="outline" 
               onClick={() => toast.dismiss(t)}
             >
-              Decline
+              Dismiss
             </Button>
             <Button 
               size="sm" 
               className="gradient-accent"
-              onClick={async () => {
+              onClick={() => {
                 toast.dismiss(t);
-                
-                // Leave current party if any
-                await leaveParty();
-                
-                // Join new party
-                const { error } = await supabase
-                  .from('party_members')
-                  .insert({ party_id: partyId, user_id: user.id });
-                
-                if (error) {
-                  toast.error('Failed to join squad: ' + error.message);
-                } else {
-                  toast.success('Joined squad!');
-                }
+                setInvitationsOpen(true);
               }}
             >
-              Accept
+              View Invitations
             </Button>
           </div>
         </div>
@@ -215,6 +220,22 @@ const Lobby: React.FC = () => {
     }
   };
 
+  const handleJoinByCode = async () => {
+    if (!joinCodeValue.trim()) {
+      toast.error('Please enter a squad code');
+      return;
+    }
+    setJoiningByCode(true);
+    const result = await joinByCode(joinCodeValue.trim());
+    setJoiningByCode(false);
+    if (result.error) {
+      toast.error(result.error);
+    } else {
+      setJoinCodeValue('');
+      setJoinCodeDialogOpen(false);
+    }
+  };
+
   const selectedMap = maps.find(m => m.mode === selectedMode) || maps[0];
 
   return (
@@ -246,46 +267,33 @@ const Lobby: React.FC = () => {
         <p className="text-right text-primary"> </p>
       </div>
 
-      {/* Inline Operator Character Panel */}
-      <section className="glass-panel p-6 mb-6">
-        <div className="flex justify-between items-center mb-6">
-          <div>
-            <h2 className="font-orbitron font-bold text-primary text-xl flex items-center gap-2">
-              {party ? <span>👥 Squad Operatives</span> : <span>👤 Active Operator</span>}
-            </h2>
-            {party && (
-              <p className="text-xs text-muted-foreground mt-1">
-                Lobby Size: {party.members.length}/{party.team_size} | Status: <strong className="text-primary uppercase font-orbitron">{party.status}</strong>
-              </p>
-            )}
-          </div>
-          <div className="flex gap-2">
-            <Button
-              onClick={() => setFriendsOpen(true)}
-              variant="outline"
-              size="sm"
-              className="flex items-center gap-2 border-primary/30 text-primary hover:bg-primary/10"
-            >
-              <Users size={16} />
-              Friends
-            </Button>
-            
-            {!party && (
+      {/* Squad Operatives Panel */}
+      {party ? (
+        <SquadPanel onInviteFriends={() => setInvitationsOpen(true)} />
+      ) : (
+        // Solo Mode fallback (while party is initializing)
+        <section className="glass-panel p-6 mb-6">
+          <div className="flex justify-between items-center mb-6">
+            <div>
+              <h2 className="font-orbitron font-bold text-primary text-xl flex items-center gap-2">
+                <span>👤 Active Operator</span>
+              </h2>
+            </div>
+            <div className="flex gap-2">
               <Button
-                onClick={() => createParty(selectedMode, parseInt(teamSize))}
+                onClick={() => setFriendsOpen(true)}
+                variant="outline"
                 size="sm"
-                className="gradient-accent font-orbitron"
+                className="flex items-center gap-2 border-primary/30 text-primary hover:bg-primary/10"
               >
-                Create Squad
+                <Users size={16} />
+                Friends
               </Button>
-            )}
+              <CreateSquadDialog />
+            </div>
           </div>
-        </div>
 
-        {/* Characters Grid */}
-        <div className="flex flex-wrap justify-center items-stretch gap-6 min-h-[340px] py-4 bg-black/20 rounded-xl border border-border/30">
-          {!party ? (
-            // Solo Mode
+          <div className="flex flex-wrap justify-center items-stretch gap-6 min-h-[340px] py-4 bg-black/20 rounded-xl border border-border/30">
             <div className="flex flex-col items-center justify-between p-4 bg-black/40 border border-border/40 rounded-xl w-[220px] shadow-glow">
               <div className="w-[180px] h-[250px] bg-black/10 rounded-lg overflow-hidden relative">
                 <CharacterViewer />
@@ -297,88 +305,96 @@ const Lobby: React.FC = () => {
                 <p className="text-xs text-muted-foreground mt-1 font-mono">Eric/Alastor</p>
               </div>
             </div>
-          ) : (
-            // Squad Mode (Characters side-by-side)
-            party.members.map((member) => {
-              const isCurrentUser = member.user_id === user?.id;
-              return (
-                <div 
-                  key={member.user_id}
-                  className={`flex flex-col items-center justify-between p-4 bg-black/40 border rounded-xl w-[200px] shadow-glow transition-all duration-300 ${
-                    isCurrentUser ? 'border-primary/40' : 'border-border/40'
-                  }`}
+          </div>
+        </section>
+      )}
+
+      {/* Action Bar (between squad panel and map selection) */}
+      <div className="flex items-center justify-between mb-6 gap-3">
+        <div className="flex gap-2">
+          <Button
+            onClick={() => setFriendsOpen(true)}
+            variant="outline"
+            size="sm"
+            className="flex items-center gap-2 border-primary/30 text-primary hover:bg-primary/10"
+          >
+            <Users size={16} />
+            Friends
+          </Button>
+
+          <Button
+            onClick={() => setInvitationsOpen(true)}
+            variant="outline"
+            size="sm"
+            className="flex items-center gap-2 border-primary/30 text-primary hover:bg-primary/10 relative"
+            id="open-invitations-btn"
+          >
+            <Mail size={16} />
+            Invitations
+            {incomingInvites.length > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full gradient-accent text-white text-[10px] font-bold flex items-center justify-center shadow-glow animate-pulse">
+                {incomingInvites.length}
+              </span>
+            )}
+          </Button>
+
+          {/* Join by Code Dialog */}
+          <Dialog open={joinCodeDialogOpen} onOpenChange={setJoinCodeDialogOpen}>
+            <DialogTrigger asChild>
+              <Button
+                variant="outline"
+                size="sm"
+                className="flex items-center gap-2 border-primary/30 text-primary hover:bg-primary/10"
+                id="join-by-code-btn"
+              >
+                <Hash size={16} />
+                Join Code
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="bg-card/95 backdrop-blur-xl border-primary/20 max-w-sm shadow-2xl" id="join-code-dialog">
+              <DialogHeader>
+                <DialogTitle className="font-orbitron text-lg text-primary flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-xl gradient-accent flex items-center justify-center shadow-glow">
+                    <Hash size={18} className="text-white" />
+                  </div>
+                  JOIN SQUAD
+                </DialogTitle>
+                <DialogDescription className="text-muted-foreground text-sm">
+                  Enter the 6-character squad code to join your friend's squad
+                </DialogDescription>
+              </DialogHeader>
+              <div className="flex flex-col gap-4 mt-2">
+                <Input
+                  placeholder="Enter squad code (e.g. ABC123)"
+                  value={joinCodeValue}
+                  onChange={(e) => setJoinCodeValue(e.target.value.toUpperCase().slice(0, 6))}
+                  onKeyDown={(e) => e.key === 'Enter' && handleJoinByCode()}
+                  className="font-mono text-lg tracking-[0.3em] text-center uppercase bg-black/30 border-primary/30 focus:border-primary placeholder:tracking-normal placeholder:text-sm"
+                  maxLength={6}
+                  id="join-code-input"
+                />
+                <Button
+                  onClick={handleJoinByCode}
+                  disabled={joiningByCode || joinCodeValue.trim().length < 4}
+                  className="gradient-accent font-orbitron text-sm glow-accent w-full"
+                  id="confirm-join-code-btn"
                 >
-                  {/* character 3D model */}
-                  <div className="w-[170px] h-[220px] bg-black/10 rounded-lg overflow-hidden relative">
-                    <CharacterViewer />
-                  </div>
-                  
-                  {/* member details */}
-                  <div className="mt-3 text-center w-full flex flex-col items-center gap-2">
-                    <div>
-                      <span className="font-medium text-sm text-foreground flex items-center justify-center gap-1.5">
-                        {member.is_leader && <Shield size={14} className="text-accent fill-accent" title="Leader" />}
-                        {member.username} {isCurrentUser && <span className="text-xs text-primary/70">(You)</span>}
-                      </span>
-                      <p className="text-xs text-muted-foreground mt-0.5 font-mono">Eric/Alastor</p>
-                    </div>
-
-                    <span className={`text-[10px] px-2 py-0.5 rounded font-orbitron border ${
-                      member.is_ready 
-                        ? 'bg-green-500/20 text-green-400 border-green-500/30' 
-                        : 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30'
-                    }`}>
-                      {member.is_ready ? 'READY' : 'NOT READY'}
-                    </span>
-
-                    {/* Inline actions inside member card */}
-                    <div className="flex gap-1.5 w-full mt-1.5">
-                      {isCurrentUser && (
-                        <>
-                          <Button
-                            size="xs"
-                            variant="outline"
-                            className={`flex-1 text-[11px] ${
-                              member.is_ready 
-                                ? 'bg-green-500/10 text-green-400 border-green-500/30 hover:bg-green-500/20' 
-                                : 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30 hover:bg-yellow-500/20'
-                            }`}
-                            onClick={toggleReady}
-                          >
-                            <Check size={12} className="mr-1" />
-                            {member.is_ready ? 'Unready' : 'Ready'}
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="outline"
-                            className="text-[11px] border-red-500/30 text-red-400 hover:bg-red-500/10 px-2"
-                            onClick={leaveParty}
-                            title="Leave Squad"
-                          >
-                            <LogOut size={12} />
-                          </Button>
-                        </>
-                      )}
-
-                      {isLeader && !isCurrentUser && (
-                        <Button
-                          size="xs"
-                          variant="outline"
-                          className="w-full text-[11px] border-red-500/30 text-red-400 hover:bg-red-500/10"
-                          onClick={() => kickMember(member.user_id)}
-                        >
-                          <UserMinus size={12} className="mr-1" />
-                          Kick
-                        </Button>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              );
-            })
-          )}
+                  {joiningByCode ? (
+                    <>
+                      <Loader2 className="animate-spin mr-2" size={16} />
+                      JOINING...
+                    </>
+                  ) : (
+                    'JOIN SQUAD'
+                  )}
+                </Button>
+              </div>
+            </DialogContent>
+          </Dialog>
         </div>
-      </section>
+
+        {!party && <CreateSquadDialog />}
+      </div>
 
       {/* Map Selection */}
       <section className="glass-panel p-5 mb-6">
@@ -443,6 +459,7 @@ const Lobby: React.FC = () => {
       </section>
 
       <FriendsPanel isOpen={friendsOpen} onClose={() => setFriendsOpen(false)} />
+      <InvitationsPanel isOpen={invitationsOpen} onClose={() => setInvitationsOpen(false)} />
     </>
   );
 };

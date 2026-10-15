@@ -472,6 +472,44 @@ export type Database = {
         }
         Relationships: []
       }
+      squad_invitations: {
+        Row: {
+          id: string
+          party_id: string
+          sender_id: string
+          receiver_id: string
+          status: string
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          party_id: string
+          sender_id: string
+          receiver_id: string
+          status?: string
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          party_id?: string
+          sender_id?: string
+          receiver_id?: string
+          status?: string
+          created_at?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "squad_invitations_party_id_fkey"
+            columns: ["party_id"]
+            isOneToOne: false
+            referencedRelation: "parties"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       user_challenges: {
         Row: {
           challenge_id: string

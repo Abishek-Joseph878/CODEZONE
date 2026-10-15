@@ -1,10 +1,9 @@
 import React, { useState } from 'react';
 import { useFriendSystem } from '@/hooks/useFriendSystem';
 import { useAuth } from '@/contexts/AuthContext';
-import { supabase } from '@/integrations/supabase/client';
 import { usePresence } from '@/hooks/usePresence';
 import { usePartySystem } from '@/hooks/usePartySystem';
-import { X, UserPlus, Check, XIcon, Copy, Loader2, Sparkles } from 'lucide-react';
+import { X, UserPlus, Check, XIcon, Copy, Loader2, Sparkles, Send } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { toast } from 'sonner';
@@ -36,11 +35,12 @@ const FriendsPanel: React.FC<FriendsPanelProps> = ({ isOpen, onClose }) => {
   } = useFriendSystem();
 
   const { isUserOnline } = usePresence();
-  const { party, createParty } = usePartySystem();
+  const { party, createParty, inviteToParty, outgoingInvites } = usePartySystem();
   
   const [friendId, setFriendId] = useState('');
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [invitingUserId, setInvitingUserId] = useState<string | null>(null);
 
   const handleAddFriend = async () => {
     if (!friendId.trim()) {
@@ -95,40 +95,28 @@ const FriendsPanel: React.FC<FriendsPanelProps> = ({ isOpen, onClose }) => {
   };
 
   const handleInviteFriend = async (friendUserId: string) => {
-    let currentPartyId = party?.id;
+    setInvitingUserId(friendUserId);
 
-    if (!currentPartyId) {
+    // Auto-create party if none exists
+    if (!party) {
       toast.info('Initializing squad...');
       const res = await createParty('duel', 5);
       if (res.error) {
         toast.error(res.error);
+        setInvitingUserId(null);
         return;
       }
-      currentPartyId = res.partyId;
     }
 
-    if (!currentPartyId) return;
+    // Use the proper inviteToParty which creates a squad_invitations DB record + broadcast
+    const result = await inviteToParty(friendUserId);
+    setInvitingUserId(null);
 
-    // Send broadcast invite via Supabase Realtime
-    const channel = supabase.channel(`invites-${friendUserId}`);
-    channel.subscribe(async (status) => {
-      if (status === 'SUBSCRIBED') {
-        const sent = await channel.send({
-          type: 'broadcast',
-          event: 'invite',
-          payload: {
-            partyId: currentPartyId,
-            leaderName: profile?.username || 'Opponent',
-          }
-        });
-        
-        toast.success('Squad invitation sent!');
-        // Clean up the channel after sending
-        setTimeout(() => {
-          supabase.removeChannel(channel);
-        }, 1000);
-      }
-    });
+    if (result.error) {
+      toast.error(result.error);
+    } else {
+      toast.success('Squad invitation sent!');
+    }
   };
 
   const copyMyId = () => {
@@ -270,15 +258,24 @@ const FriendsPanel: React.FC<FriendsPanelProps> = ({ isOpen, onClose }) => {
                           <span className="text-xs text-primary font-bold bg-primary/10 border border-primary/20 px-2.5 py-1 rounded font-orbitron animate-pulse">
                             IN SQUAD
                           </span>
+                        ) : outgoingInvites.some(inv => inv.receiver_id === friend.friendId) ? (
+                          <span className="text-xs text-yellow-400 font-bold bg-yellow-500/10 border border-yellow-500/20 px-2.5 py-1 rounded font-orbitron">
+                            INVITED
+                          </span>
                         ) : (
                           <Button
                             onClick={() => handleInviteFriend(friend.friendId)}
                             size="sm"
                             variant="ghost"
+                            disabled={invitingUserId === friend.friendId}
                             className="text-primary hover:bg-primary/20 hover:scale-105 transition-all p-2 rounded-full h-9 w-9 flex items-center justify-center border border-primary/20 shadow-glow"
                             title="Invite to Squad"
                           >
-                            <UserPlus size={18} />
+                            {invitingUserId === friend.friendId ? (
+                              <Loader2 size={16} className="animate-spin" />
+                            ) : (
+                              <UserPlus size={18} />
+                            )}
                           </Button>
                         )
                       ) : (
